@@ -1,81 +1,50 @@
-# learn_cpp_asio
-学习ASIO网络编程
-# 复习一下网络编程基本流程
-服务端：
-1.socket--创建socket对象
-2.bind--绑定本机ip+port
-3.listen--监听连接，有的话就建立连接
-4.accept--在创建一个socket对象给其收发消息，原因是现实中服务端都是面对多个客户端，那么为了区分各个客户端，则每个客户端都需再分配一个socket对象进行收发消息
-5.read、write--收发消息
-客户端：
-1.socket--创建socket对象
-2.connect--根据服务端ip+port，发起建立连接请求
-3.read、write--收发消息
-![在这里插入图片描述](https://i-blog.csdnimg.cn/direct/1f1894cf85a4490f9e8e27352c549b3d.png)
+## 客户端流程：
 
-> 那么asio网络编程和socket编程有啥区别？socket编程通常是同步io阻塞的，单机支持的qps可以说是很低，asio支持异步io操作，基于事件驱动，通过触发回调函数来执行其他任务，提高内在的工作效率。
+开一百个线程，每个线程都发hello world!然后等待回包。 按照TLV的格式，MsgID、MsgHead和MsgData，
+> 发数据：先发MsgID，偏移下数据，发MsgHead，更新偏移，发MsgData
 
-在asio中其实类似socket，通过创建一个终端节点endpoint（用来通信的端对端节点，ip+port），服务端依靠endpoint实现通信。
-## 终端节点创建
-客户端
-```cpp
-std::string raw_ip_address = "127.0.0.1";
-    unsigned short port_num = 3333;
-    boost::system::error_code ec;
-    asio::ip::address ip_address =
-        asio::ip::address::from_string(raw_ip_address, ec);
-    if (ec.value() != 0) {
-        std::cout
-            << "Failed to parse the IP address. Error code = "
-            << ec.value() << ". Message: " << ec.message();
-        return ec.value();
-    }
-    asio::ip::tcp::endpoint ep(ip_address, port_num);
-```
-服务端直接绑定ip+port就行
+![在这里插入图片描述](https://i-blog.csdnimg.cn/direct/4ae600a373b84b76a8b76b599793dc3f.png)
+>收数据：接受MsgID（2B）长度的数据，接受MsgHead（2B）长度的数据，接受MsgLeng长度的数据
 
-```cpp
- unsigned short port_num = 3333;
-    asio::ip::address ip_address = asio::ip::address_v6::any();
-    asio::ip::tcp::endpoint ep(ip_address, port_num);
-```
-## 创建socket
-创建socket分为4步，创建上下文iocontext，选择协议，生成socket，打开socket
+![在这里插入图片描述](https://i-blog.csdnimg.cn/direct/58c95d11f4f248e49d24809ebef7ff72.png)
+## 服务端流程：
 
-```cpp
-    //创建上下文
-    asio::io_context  ios;
-    // Step 2. Creating an object of 'tcp' class representing
-    asio::ip::tcp protocol = asio::ip::tcp::v4();
-    // Step 3. Instantiating an active TCP socket object.
-    asio::ip::tcp::socket sock(ios);
-    boost::system::error_code ec;
-    // Step 4. Opening the socket.
-    sock.open(protocol, ec);
-    if (ec.value() != 0) {
-        std::cout
-            << "Failed to open the socket! Error code = "
-            << ec.value() << ". Message: " << ec.message();
-        return ec.value();
-    }
-```
-服务端还需要创建一个acceptor的socket
-## 绑定acceptor
+ - 采用的是多io_context多线程的模式异步协程处理模式 主线程初始化一个io_context，异步监听连接事件
+   ![在这里插入图片描述](https://i-blog.csdnimg.cn/direct/1e88c08c851347b58e262f604247dc61.png)
+ - 有连接上来后触发回调函数HandleAccept，HandleAccept主要是新建一个Session，这个Session会启动协程去接受数据，且这里Session和io_context都是新的，每来一个连接都会在ServicePool里面拿一个出来。
 
-```cpp
-unsigned short port_num = 3333;
-    asio::ip::tcp::endpoint ep(asio::ip::address_v4::any(),
-        port_num);
-    asio::io_context  ios;
-    asio::ip::tcp::acceptor acceptor(ios, ep.protocol());
-    boost::system::error_code ec;
-    acceptor.bind(ep, ec);
-```
-后面内容和socket编程类似，都是acceptor充当前单接待员，前台短暂接待顾客，后续分配给新的服务员（new socket），注意的是，需要保证服务员完成服务后，前台才能闭店（异步操作时需要等所有子线程完成时才能结束主线程）。
+   
+ 
+
+ - 读数据流程： 读取MsgID（2B）长度的数据，读取MsgHead（2B）长度的数据，读取MsgLeng长度的数据
+
+![在这里插入图片描述](https://i-blog.csdnimg.cn/direct/b91af5f6b84f4f12a1b3a7e039eb2fa6.png)
+
+ - 写数据流程：之前异步读完之后不会立马去写，而是先投放到一个逻辑队列里面去统一处理，在投递时会调用LogicSystem的构造函数，LogicSystem()会注册一个map，map里存放的回调函数，当回调函数获得锁会去读取队列中的数据返回消息给客户端，这里每个socket对应的io_context是独立的，所以不用再封装一层strand队列去单独控制处理回调函数。
+
+>  发送数据流程： 发送MsgID（2B）长度的数据，发送MsgHead（2B）长度的数据，发送MsgLeng长度的数据
+
+![在这里插入图片描述](https://i-blog.csdnimg.cn/direct/aee8667b35864267827172430b3cd4b2.png)
+### 大概的一些细节
+
+ - MsgNode是一个基类，_cur_len是表示当前发送的长度，_total_len是代表总长度，_data是数据首地址，用首地址+偏移来定位数据，**但_total_len这里比较宽泛，正对发送和接受节点有不一样的意义**，我们在构造函数中把成员变量使用列表初始化的方式初始化，数据后面用'\0'结尾。
+ - 
+   数据发送是依靠jsoncpp来序列化的，为什么选择jsoncpp呢？相比于Protobuf确实性能有些许下降，但优势在于数据是可视的，可读性较好，而且一般情况下**Protobuf适用于服务之间传递传输消息，服务端和客户端之间用json就足够**
+
+![在这里插入图片描述](https://i-blog.csdnimg.cn/direct/defead9ae6334b88a9b3c2fcf536aba0.png)
+
+然后单独有RecvNode和SendNode，这里声明LogicSystem的友元是因为消息id设置成了私有，
+![在这里插入图片描述](https://i-blog.csdnimg.cn/direct/deeaa66a55a949c79d3e056ec4d70360.png)
+RecvNode和SendNode构造函数会有些不一样，接受节点因为头部和数据分开接受的，所以_total_len=max_len,发送节点就需要包括头部的信息，所以是_total_len=max_len + HEAD_TOTAL_LEN
+![在这里插入图片描述](https://i-blog.csdnimg.cn/direct/9dce719ba2d84678b40a6d38f6608985.png)
+
+## 最后结果
+
+最终效果：客户端开一百个线程，每个线程发500条消息，每个线程之间间隔10毫秒怕电脑顶不住，实验室工作站太拉了（老师有点抠门）
+![在这里插入图片描述](https://i-blog.csdnimg.cn/direct/428d754be98f4e82b5a6704d4f0e3d2d.png)
+![在这里插入图片描述](https://i-blog.csdnimg.cn/direct/3f3251c26fc64d9bae6071ac5eabd21a.png)
 
 
-## 一些思考
-asio网络库有自己的buffer数据结构，就是接受和发送数据时的缓冲区。
-boost::asio提供了asio::mutable_buffer 和 asio::const_buffer这两个结构，可变长和固定长度。
-常量用于读，变量用于写。
-可以把buffer理解为一个vector里面存储的都是一个地址，每个地址指向了length+data。
+计算一下用时结果，100x500=50k条消息，std::cout好像是很费时的，这么看好像性能还不错诶。
+![在这里插入图片描述](https://i-blog.csdnimg.cn/direct/6b4464b2cc784e65a6e146355796b627.png)
+![在这里插入图片描述](https://i-blog.csdnimg.cn/direct/72898fb9d4ec41369906ef4e6a7c1833.png)
